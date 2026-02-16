@@ -13,6 +13,7 @@ use sia::signing::{PrivateKey, Signature};
 use sia::types::Hash256;
 use std::str::FromStr;
 use std::time::SystemTime;
+use chrono::{TimeZone, Utc};
 use tokio::io::AsyncWrite;
 use wasm_bindgen::prelude::*;
 
@@ -1044,34 +1045,65 @@ impl SDK {
         self.inner.prune_slabs().await.map_err(to_js_err)
     }
 
-    /// Lists objects from the indexer. Returns a JSON array of object events.
-    /// Each event has { id, deleted, updatedAt, size }.
-    /// Pass limit=0 or null to use the server default.
-    #[wasm_bindgen(js_name = "listObjects")]
-    pub async fn list_objects(&self, limit: Option<usize>) -> Result<String, JsError> {
-        let limit = limit.filter(|&l| l > 0);
-        let events = self
-            .inner
-            .object_events(None, limit)
-            .await
-            .map_err(to_js_err)?;
+    /// Returns object events for syncing. Supports cursor-based pagination.
+    ///
+    /// `cursor_json` is an optional JSON string: `{"id": "hex...", "after": <epoch_ms>}`
+    /// `limit` is the maximum number of events to return.
+    ///
+    /// Returns a JS array of objects:
+    /// `[{ id: string, deleted: bool, updatedAt: number, object: PinnedObject | null }]`
+    #[wasm_bindgen(js_name = "objectEvents")]
+    pub async fn object_events(
+        &self,
+        cursor_json: Option<String>,
+        limit: u32,
+    ) -> Result<JsValue, JsError> {
+        let cursor = match cursor_json {
+            Some(json) => {
+                let parsed: serde_json::Value = serde_json::from_str(&json).map_err(to_js_err)?;
+                let id_str = parsed["id"].as_str().ok_or_else(|| JsError::new("cursor missing 'id'"))?;
+                let after_ms = parsed["after"].as_i64().ok_or_else(|| JsError::new("cursor missing 'after'"))?;
+                let id = sia::types::Hash256::from_str(id_str).map_err(to_js_err)?;
+                let after = Utc.timestamp_millis_opt(after_ms)
+                    .single()
+                    .ok_or_else(|| JsError::new("invalid 'after' timestamp"))?;
+                Some(indexd::app_client::ObjectsCursor { id, after })
+            }
+            None => None,
+        };
 
-        let json_events: Vec<serde_json::Value> = events
-            .iter()
-            .map(|e| {
-                let mut obj = serde_json::json!({
-                    "id": e.id.to_string(),
-                    "deleted": e.deleted,
-                    "updated_at": e.updated_at.to_rfc3339(),
-                });
-                if let Some(ref object) = e.object {
-                    obj["size"] = serde_json::json!(object.size());
+        let events = self.inner.object_events(cursor, Some(limit as usize)).await.map_err(to_js_err)?;
+
+        let arr = js_sys::Array::new();
+        let js_err = |_| JsError::new("failed to set property on object");
+        for event in events {
+            let obj = js_sys::Object::new();
+            js_sys::Reflect::set(&obj, &"id".into(), &event.id.to_string().into())
+                .map_err(js_err)?;
+            js_sys::Reflect::set(&obj, &"deleted".into(), &event.deleted.into())
+                .map_err(js_err)?;
+            js_sys::Reflect::set(
+                &obj,
+                &"updatedAt".into(),
+                &JsValue::from_f64(event.updated_at.timestamp_millis() as f64),
+            )
+            .map_err(js_err)?;
+
+            let pinned_val = match event.object {
+                Some(o) => {
+                    let pinned = PinnedObject {
+                        inner: Arc::new(Mutex::new(o)),
+                    };
+                    pinned.into()
                 }
-                obj
-            })
-            .collect();
+                None => JsValue::NULL,
+            };
+            js_sys::Reflect::set(&obj, &"object".into(), &pinned_val)
+                .map_err(js_err)?;
 
-        serde_json::to_string(&json_events).map_err(to_js_err)
+            arr.push(&obj);
+        }
+        Ok(arr.into())
     }
 
     /// Creates a share URL for an object, valid until the given timestamp (ms since epoch).
