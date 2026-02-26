@@ -521,6 +521,41 @@ impl SDK {
         Ok(Uint8Array::from(buf.as_slice()))
     }
 
+    /// Downloads a byte range from an object, returning the decrypted data as a Uint8Array.
+    ///
+    /// Only downloads the slabs that overlap the requested range, making this
+    /// much more efficient than `download()` for small reads from large objects.
+    #[wasm_bindgen(js_name = "downloadRange")]
+    pub async fn download_range(
+        &self,
+        object: &PinnedObject,
+        offset: f64,
+        length: f64,
+        options: DownloadOptions,
+    ) -> Result<Uint8Array, JsError> {
+        let offset = offset as u64;
+        let length = length as u64;
+        let obj = object.inner.lock().map_err(to_js_err)?.clone();
+        let mut buf = vec![0u8; length as usize];
+
+        let options = options.into_indexd_ranged(offset, length, None);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(to_js_err)?;
+        let _guard = rt.enter();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                self.inner
+                    .download(&mut Cursor::new(&mut buf), &obj, options)
+                    .await
+            })
+            .await
+            .map_err(to_js_err)?;
+        Ok(Uint8Array::from(buf.as_slice()))
+    }
+
     /// Downloads an object with streaming chunks.
     /// Fires `on_chunk(bytes)` after each slab is decoded and `on_progress(current, total)` for progress.
     #[wasm_bindgen(js_name = "downloadStreaming")]
