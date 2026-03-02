@@ -506,14 +506,15 @@ impl NativeBuilder {
     pub async fn request_connection(&self, app_meta_json: String) -> Result<()> {
         #[derive(serde::Deserialize)]
         struct AppMetaInput {
+            #[serde(rename = "appID")]
             id: String,
             name: String,
             description: String,
-            #[serde(rename = "serviceUrl")]
+            #[serde(rename = "serviceURL")]
             service_url: String,
-            #[serde(rename = "logoUrl")]
+            #[serde(rename = "logoURL")]
             logo_url: Option<String>,
-            #[serde(rename = "callbackUrl")]
+            #[serde(rename = "callbackURL")]
             callback_url: Option<String>,
         }
         let meta: AppMetaInput =
