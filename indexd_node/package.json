@@ -1,0 +1,9 @@
+{
+  "name": "indexd-node",
+  "version": "0.1.0",
+  "private": true,
+  "napi": {
+    "name": "indexd_node",
+    "triples": {}
+  }
+}
