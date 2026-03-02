@@ -396,7 +396,7 @@ enum PackedUploadAction {
 
 #[napi]
 pub struct NativePackedUpload {
-    upload_task: Option<AbortOnDropHandle<()>>,
+    upload_task: Mutex<Option<AbortOnDropHandle<()>>>,
     tx: mpsc::Sender<PackedUploadAction>,
     slab_size: u64,
     length: Arc<AtomicU64>,
@@ -446,7 +446,7 @@ impl NativePackedUpload {
     }
 
     #[napi]
-    pub async fn finalize(&mut self) -> Result<Vec<NativePinnedObject>> {
+    pub async fn finalize(&self) -> Result<Vec<NativePinnedObject>> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Err(Error::from_reason("packed upload is closed"));
         }
@@ -466,11 +466,11 @@ impl NativePackedUpload {
     }
 
     #[napi]
-    pub async fn cancel(&mut self) -> Result<()> {
+    pub async fn cancel(&self) -> Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Err(Error::from_reason("packed upload is closed"));
         }
-        if let Some(task) = self.upload_task.take() {
+        if let Some(task) = self.upload_task.lock().unwrap().take() {
             task.abort();
         }
         Ok(())
@@ -743,6 +743,70 @@ impl NativeBuilder {
     }
 }
 
+// -- UploadTask (async task for upload with progress callback) --
+
+pub struct UploadTask {
+    sdk: indexd::SDK,
+    data: Vec<u8>,
+    data_shards: u8,
+    parity_shards: u8,
+    max_inflight: usize,
+    tsfn: napi::threadsafe_function::ThreadsafeFunction<
+        (u64, u64),
+        napi::threadsafe_function::ErrorStrategy::Fatal,
+    >,
+}
+
+impl Task for UploadTask {
+    type Output = indexd::Object;
+    type JsValue = NativePinnedObject;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let sdk = self.sdk.clone();
+        let reader = Cursor::new(std::mem::take(&mut self.data));
+        let data_shards = self.data_shards;
+        let parity_shards = self.parity_shards;
+        let max_inflight = self.max_inflight;
+
+        let total_shards = data_shards as u64 + parity_shards as u64;
+        let slab_encoded_size = total_shards * SECTOR_SIZE as u64;
+        let tsfn = self.tsfn.clone();
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<()>();
+        RUNTIME.spawn(async move {
+            let mut sectors: u64 = 0;
+            while progress_rx.recv().await.is_some() {
+                sectors += 1;
+                let size = sectors * SECTOR_SIZE as u64;
+                let slabs_size = sectors.div_ceil(total_shards) * slab_encoded_size;
+                tsfn.call(
+                    (size, slabs_size),
+                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+        });
+
+        RUNTIME
+            .block_on(async move {
+                sdk.upload(
+                    reader,
+                    indexd::UploadOptions {
+                        max_inflight,
+                        data_shards,
+                        parity_shards,
+                        shard_uploaded: Some(progress_tx),
+                    },
+                )
+                .await
+                .map_err(|e| Error::from_reason(e.to_string()))
+            })
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(NativePinnedObject::from_object(output))
+    }
+}
+
 // -- NativeSDK --
 
 #[napi]
@@ -812,77 +876,36 @@ impl NativeSDK {
         Ok(NativePinnedObject::from_object(obj))
     }
 
-    #[napi]
-    pub async fn upload(
-        &self,
-        data: Buffer,
-        options: NativeUploadOptions,
-        #[napi(ts_arg_type = "(current: number, total: number) => void")] on_progress: JsFunction,
-    ) -> Result<NativePinnedObject> {
+    #[napi(
+        js_name = "upload",
+        ts_args_type = "data: Buffer, options: NativeUploadOptions, onProgress: (current: number, total: number) => void",
+        ts_return_type = "Promise<NativePinnedObject>"
+    )]
+    pub fn upload(&self, data: Buffer, options: NativeUploadOptions, on_progress: JsFunction) -> Result<AsyncTask<UploadTask>> {
         let data_shards = options.data_shards.unwrap_or(10) as u8;
         let parity_shards = options.parity_shards.unwrap_or(20) as u8;
         let max_inflight = options.max_inflight.unwrap_or(10) as usize;
 
-        let progress_cb: Option<
-            napi::threadsafe_function::ThreadsafeFunction<
-                (u64, u64),
-                napi::threadsafe_function::ErrorStrategy::Fatal,
-            >,
-        > = {
-            let tsfn = on_progress.create_threadsafe_function(
-                0,
-                |ctx: napi::threadsafe_function::ThreadSafeCallContext<(u64, u64)>| {
-                    let current = ctx.env.create_double(ctx.value.0 as f64)?;
-                    let total = ctx.env.create_double(ctx.value.1 as f64)?;
-                    Ok(vec![current, total])
-                },
-            )?;
-            Some(tsfn)
-        };
+        let tsfn: napi::threadsafe_function::ThreadsafeFunction<
+            (u64, u64),
+            napi::threadsafe_function::ErrorStrategy::Fatal,
+        > = on_progress.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<(u64, u64)>| {
+                let current = ctx.env.create_double(ctx.value.0 as f64)?;
+                let total = ctx.env.create_double(ctx.value.1 as f64)?;
+                Ok(vec![current, total])
+            },
+        )?;
 
-        let sdk = self.inner.clone();
-        let reader = Cursor::new(data.to_vec());
-
-        let total_shards = data_shards as u64 + parity_shards as u64;
-        let slab_encoded_size = total_shards * SECTOR_SIZE as u64;
-
-        let obj = spawn(async move {
-            let progress_tx = if let Some(cb) = progress_cb {
-                let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-                tokio::spawn(async move {
-                    let mut sectors: u64 = 0;
-                    while rx.recv().await.is_some() {
-                        sectors += 1;
-                        let size = sectors * SECTOR_SIZE as u64;
-                        let slabs_size = sectors.div_ceil(total_shards) * slab_encoded_size;
-                        cb.call(
-                            (size, slabs_size),
-                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                        );
-                    }
-                });
-                Some(tx)
-            } else {
-                None
-            };
-
-            sdk.upload(
-                reader,
-                indexd::UploadOptions {
-                    max_inflight,
-                    data_shards,
-                    parity_shards,
-                    shard_uploaded: progress_tx,
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(|e| Error::from_reason(e))?;
-
-        Ok(NativePinnedObject::from_object(obj))
+        Ok(AsyncTask::new(UploadTask {
+            sdk: self.inner.clone(),
+            data: data.to_vec(),
+            data_shards,
+            parity_shards,
+            max_inflight,
+            tsfn,
+        }))
     }
 
     #[napi(js_name = "uploadPacked")]
@@ -926,7 +949,7 @@ impl NativeSDK {
         });
 
         NativePackedUpload {
-            upload_task: Some(upload_task),
+            upload_task: Mutex::new(Some(upload_task)),
             tx: action_tx,
             slab_size,
             length,
@@ -995,6 +1018,7 @@ impl NativeSDK {
                     offset: 0,
                     length: None,
                     max_inflight,
+                    slab_downloaded: None,
                 },
             )
             .await
@@ -1033,6 +1057,7 @@ impl NativeSDK {
                     offset: slab.offset as u64,
                     length: Some(slab.length as u64),
                     max_inflight,
+                    slab_downloaded: None,
                 },
             )
             .await
