@@ -385,6 +385,24 @@ impl PinnedObject {
         Ok(())
     }
 
+    /// Returns the slab layout as a JSON array.
+    ///
+    /// Each element contains `offset`, `length`, `minShards`, and `hostKeys`
+    /// (an array of host public-key strings identifying which hosts store
+    /// each sector of the slab).
+    pub fn slabs(&self) -> Result<JsValue, JsError> {
+        let inner = self.inner.lock().map_err(to_js_err)?;
+        let slabs: Vec<serde_json::Value> = inner.slabs().iter().map(|s| {
+            serde_json::json!({
+                "offset": s.offset,
+                "length": s.length,
+                "minShards": s.min_shards,
+                "hostKeys": s.sectors.iter().map(|sec| sec.host_key.to_string()).collect::<Vec<_>>(),
+            })
+        }).collect();
+        serde_wasm_bindgen::to_value(&slabs).map_err(to_js_err)
+    }
+
     /// Returns the number of slabs in the object.
     ///
     /// Useful for sizing a Web Worker pool (cap workers at slab count) and
