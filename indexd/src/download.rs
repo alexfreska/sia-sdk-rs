@@ -18,6 +18,7 @@ use tokio::time::error::Elapsed;
 
 use crate::rhp4::RHP4Client;
 use crate::{Hosts, Object, Sector};
+use sia::signing::PublicKey;
 
 #[derive(Debug, Error)]
 pub enum DownloadError {
@@ -62,6 +63,9 @@ pub struct DownloadOptions {
     /// Optional channel to notify when each slab is downloaded.
     /// This can be used to implement progress reporting.
     pub slab_downloaded: Option<mpsc::UnboundedSender<()>>,
+
+    /// Reports the host public key of each successfully downloaded sector.
+    pub sector_downloaded: Option<mpsc::UnboundedSender<PublicKey>>,
 }
 
 impl Default for DownloadOptions {
@@ -74,6 +78,7 @@ impl Default for DownloadOptions {
             offset: 0,
             length: None,
             slab_downloaded: None,
+            sector_downloaded: None,
         }
     }
 }
@@ -101,17 +106,18 @@ impl Downloader {
         transport: Arc<dyn RHP4Client>,
         account_key: Arc<PrivateKey>,
         task: SectorDownloadTask,
-    ) -> Result<(usize, Vec<u8>), DownloadError> {
+    ) -> Result<(usize, PublicKey, Vec<u8>), DownloadError> {
+        let host_key = task.sector.host_key;
         let data = transport
             .read_sector(
-                task.sector.host_key,
+                host_key,
                 &account_key,
                 task.sector.root,
                 task.offset as usize,
                 task.length as usize,
             )
             .await?;
-        Ok((task.index, data.to_vec()))
+        Ok((task.index, host_key, data.to_vec()))
     }
 
     pub fn new(hosts: Hosts, transport: Arc<dyn RHP4Client>, account_key: Arc<PrivateKey>) -> Self {
@@ -136,6 +142,7 @@ impl Downloader {
         offset: u64,
         length: u64,
         max_inflight: usize,
+        sector_downloaded: &Option<mpsc::UnboundedSender<PublicKey>>,
     ) -> Result<Vec<Option<Vec<u8>>>, DownloadError> {
         if sectors.len() < min_shards as usize {
             return Err(DownloadError::InvalidSlab(format!(
@@ -218,7 +225,7 @@ impl Downloader {
                 biased;
                 Some(res) = download_tasks.join_next() => {
                     match res? { // safe because tasks are never cancelled
-                        Ok((index, mut data)) => {
+                        Ok((index, host_key, mut data)) => {
                             let encryption_key = encryption_key.clone();
                             let data = maybe_spawn_blocking!({
                                 encrypt_shard(&encryption_key, index as u8, offset as usize, &mut data);
@@ -226,6 +233,9 @@ impl Downloader {
                             });
                             shards[index] = Some(data);
                             successful += 1;
+                            if let Some(tx) = sector_downloaded {
+                                let _ = tx.send(host_key);
+                            }
                             if successful >= min_shards {
                                return Ok(shards);
                             }
@@ -325,6 +335,7 @@ impl Downloader {
                     shard_offset,
                     shard_length,
                     options.max_inflight,
+                    &options.sector_downloaded,
                 )
                 .await?;
             let data_shards = slab.min_shards as usize;

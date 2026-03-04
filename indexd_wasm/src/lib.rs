@@ -9,7 +9,7 @@ use indexd::app_client::{RegisterAppRequest, RegisterAppResponse};
 use js_sys::Uint8Array;
 use sia::rhp::SECTOR_SIZE;
 use sia::seed::Seed;
-use sia::signing::{PrivateKey, Signature};
+use sia::signing::{PrivateKey, PublicKey, Signature};
 use sia::types::Hash256;
 use std::str::FromStr;
 use std::time::SystemTime;
@@ -107,12 +107,14 @@ impl DownloadOptions {
     fn into_indexd(
         self,
         tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+        sector_tx: Option<tokio::sync::mpsc::UnboundedSender<PublicKey>>,
     ) -> indexd::DownloadOptions {
         indexd::DownloadOptions {
             max_inflight: self.max_inflight,
             offset: 0,
             length: None,
             slab_downloaded: tx,
+            sector_downloaded: sector_tx,
         }
     }
 
@@ -121,12 +123,14 @@ impl DownloadOptions {
         offset: u64,
         length: u64,
         tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+        sector_tx: Option<tokio::sync::mpsc::UnboundedSender<PublicKey>>,
     ) -> indexd::DownloadOptions {
         indexd::DownloadOptions {
             max_inflight: self.max_inflight,
             offset,
             length: Some(length),
             slab_downloaded: tx,
+            sector_downloaded: sector_tx,
         }
     }
 }
@@ -514,7 +518,7 @@ impl SDK {
         let mut buf = vec![0u8; size];
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = options.into_indexd(Some(tx));
+        let options = options.into_indexd(Some(tx), None);
 
         let on_progress = on_progress.clone();
         local
@@ -543,6 +547,9 @@ impl SDK {
     ///
     /// Only downloads the slabs that overlap the requested range, making this
     /// much more efficient than `download()` for small reads from large objects.
+    ///
+    /// The `on_sector` callback is called with the host public key string for
+    /// each sector successfully downloaded.
     #[wasm_bindgen(js_name = "downloadRange")]
     pub async fn download_range(
         &self,
@@ -550,21 +557,32 @@ impl SDK {
         offset: f64,
         length: f64,
         options: DownloadOptions,
+        on_sector: &js_sys::Function,
     ) -> Result<Uint8Array, JsError> {
         let offset = offset as u64;
         let length = length as u64;
         let obj = object.inner.lock().map_err(to_js_err)?.clone();
         let mut buf = vec![0u8; length as usize];
 
-        let options = options.into_indexd_ranged(offset, length, None);
+        let (sector_tx, mut sector_rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = options.into_indexd_ranged(offset, length, None, Some(sector_tx));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .map_err(to_js_err)?;
         let _guard = rt.enter();
         let local = tokio::task::LocalSet::new();
+        let on_sector = on_sector.clone();
         local
             .run_until(async {
+                tokio::task::spawn_local(async move {
+                    while let Some(host_key) = sector_rx.recv().await {
+                        let _ = on_sector.call1(
+                            &JsValue::NULL,
+                            &JsValue::from_str(&host_key.to_string()),
+                        );
+                    }
+                });
                 self.inner
                     .download(&mut Cursor::new(&mut buf), &obj, options)
                     .await
@@ -624,7 +642,7 @@ impl SDK {
         let total_slabs = obj.slabs().len() as u32;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let options = options.into_indexd(Some(tx));
+        let options = options.into_indexd(Some(tx), None);
 
         let mut writer = ChunkWriter {
             callback: on_chunk.clone(),
@@ -677,7 +695,7 @@ impl SDK {
         let length = slabs[idx].length as u64;
         let mut buf = vec![0u8; length as usize];
 
-        let options = options.into_indexd_ranged(offset, length, None);
+        let options = options.into_indexd_ranged(offset, length, None, None);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
