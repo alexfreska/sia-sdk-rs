@@ -679,6 +679,7 @@ impl SDK {
         object: &PinnedObject,
         slab_index: u32,
         options: DownloadOptions,
+        on_sector: &js_sys::Function,
     ) -> Result<Uint8Array, JsError> {
         let obj = object.inner.lock().map_err(to_js_err)?.clone();
         let slabs = obj.slabs();
@@ -695,15 +696,25 @@ impl SDK {
         let length = slabs[idx].length as u64;
         let mut buf = vec![0u8; length as usize];
 
-        let options = options.into_indexd_ranged(offset, length, None, None);
+        let (sector_tx, mut sector_rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = options.into_indexd_ranged(offset, length, None, Some(sector_tx));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .map_err(to_js_err)?;
         let _guard = rt.enter();
         let local = tokio::task::LocalSet::new();
+        let on_sector = on_sector.clone();
         local
             .run_until(async {
+                tokio::task::spawn_local(async move {
+                    while let Some(host_key) = sector_rx.recv().await {
+                        let _ = on_sector.call1(
+                            &JsValue::NULL,
+                            &JsValue::from_str(&host_key.to_string()),
+                        );
+                    }
+                });
                 self.inner
                     .download(&mut Cursor::new(&mut buf), &obj, options)
                     .await
