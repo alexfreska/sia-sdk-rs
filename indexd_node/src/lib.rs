@@ -1,10 +1,13 @@
 #[macro_use]
 extern crate napi_derive;
 
+use std::collections::HashMap;
 use std::io::Cursor;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use indexd::Url;
@@ -14,6 +17,7 @@ use sia::rhp::SECTOR_SIZE;
 use sia::seed::Seed;
 use sia::signing::{PrivateKey, PublicKey, Signature};
 use sia::types::Hash256;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::{self, Runtime};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::task::AbortOnDropHandle;
@@ -63,19 +67,30 @@ impl NativeAppKey {
     #[napi(constructor)]
     pub fn new(key: Buffer) -> Result<Self> {
         let bytes = key.as_ref();
-        if bytes.len() != 32 {
-            return Err(Error::from_reason("app keys must be 32 bytes"));
+        match bytes.len() {
+            64 => {
+                let mut keypair = [0u8; 64];
+                keypair.copy_from_slice(bytes);
+                Ok(NativeAppKey {
+                    key: PrivateKey::from(keypair),
+                })
+            }
+            32 => {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(bytes);
+                Ok(NativeAppKey {
+                    key: PrivateKey::from_seed(&seed),
+                })
+            }
+            _ => Err(Error::from_reason(
+                "app key must be 64 bytes (keypair) or 32 bytes (seed)",
+            )),
         }
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(bytes);
-        Ok(NativeAppKey {
-            key: PrivateKey::from_seed(&seed),
-        })
     }
 
     #[napi]
     pub fn export(&self) -> Buffer {
-        Buffer::from(self.key.as_ref()[..32].to_vec())
+        Buffer::from(self.key.as_ref().to_vec())
     }
 
     #[napi(js_name = "publicKey")]
@@ -188,6 +203,12 @@ impl NativePinnedObject {
     pub fn updated_at(&self) -> f64 {
         let inner = self.inner.lock().unwrap();
         system_time_to_epoch_ms((*inner.updated_at()).into())
+    }
+
+    #[napi(js_name = "slabLengths")]
+    pub fn slab_lengths(&self) -> Vec<u32> {
+        let inner = self.inner.lock().unwrap();
+        inner.slabs().iter().map(|s| s.length).collect()
     }
 }
 
@@ -808,6 +829,386 @@ impl Task for UploadTask {
     }
 }
 
+// -- DownloadTask --
+
+pub struct DownloadTask {
+    sdk: indexd::SDK,
+    obj: indexd::Object,
+    max_inflight: usize,
+    offset: u64,
+    length: Option<u64>,
+    progress_tsfn: Option<
+        napi::threadsafe_function::ThreadsafeFunction<
+            (u32, u32),
+            napi::threadsafe_function::ErrorStrategy::Fatal,
+        >,
+    >,
+    sector_tsfn: Option<
+        napi::threadsafe_function::ThreadsafeFunction<
+            String,
+            napi::threadsafe_function::ErrorStrategy::Fatal,
+        >,
+    >,
+}
+
+impl Task for DownloadTask {
+    type Output = Vec<u8>;
+    type JsValue = Buffer;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let sdk = self.sdk.clone();
+        let obj = self.obj.clone();
+        let max_inflight = self.max_inflight;
+        let offset = self.offset;
+        let length = self.length;
+        let total_slabs = obj.slabs().len() as u32;
+
+        let slab_downloaded = if let Some(tsfn) = self.progress_tsfn.take() {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            RUNTIME.spawn(async move {
+                let mut count: u32 = 0;
+                while rx.recv().await.is_some() {
+                    count += 1;
+                    tsfn.call(
+                        (count, total_slabs),
+                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
+            });
+            Some(tx)
+        } else {
+            None
+        };
+
+        let sector_downloaded = if let Some(tsfn) = self.sector_tsfn.take() {
+            let (tx, mut rx) = mpsc::unbounded_channel::<PublicKey>();
+            RUNTIME.spawn(async move {
+                while let Some(host_key) = rx.recv().await {
+                    tsfn.call(
+                        host_key.to_string(),
+                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
+            });
+            Some(tx)
+        } else {
+            None
+        };
+
+        RUNTIME.block_on(async move {
+            let mut buf = Vec::new();
+            sdk.download(
+                &mut buf,
+                &obj,
+                indexd::DownloadOptions {
+                    offset,
+                    length,
+                    max_inflight,
+                    slab_downloaded,
+                    sector_downloaded,
+                },
+            )
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+            Ok(buf)
+        })
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(Buffer::from(output))
+    }
+}
+
+// -- DownloadStreamingTask --
+
+pub struct DownloadStreamingTask {
+    sdk: indexd::SDK,
+    obj: indexd::Object,
+    max_inflight: usize,
+    chunk_tsfn: napi::threadsafe_function::ThreadsafeFunction<
+        Vec<u8>,
+        napi::threadsafe_function::ErrorStrategy::Fatal,
+    >,
+    progress_tsfn: napi::threadsafe_function::ThreadsafeFunction<
+        (u32, u32),
+        napi::threadsafe_function::ErrorStrategy::Fatal,
+    >,
+}
+
+/// Custom AsyncWrite that calls a threadsafe function with each chunk
+struct ChunkWriter {
+    tsfn: napi::threadsafe_function::ThreadsafeFunction<
+        Vec<u8>,
+        napi::threadsafe_function::ErrorStrategy::Fatal,
+    >,
+}
+
+impl AsyncWrite for ChunkWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.tsfn.call(
+            buf.to_vec(),
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+        );
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Task for DownloadStreamingTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let sdk = self.sdk.clone();
+        let obj = self.obj.clone();
+        let max_inflight = self.max_inflight;
+        let total_slabs = obj.slabs().len() as u32;
+        let progress_tsfn = self.progress_tsfn.clone();
+
+        let (slab_tx, mut slab_rx) = mpsc::unbounded_channel();
+        RUNTIME.spawn(async move {
+            let mut count: u32 = 0;
+            while slab_rx.recv().await.is_some() {
+                count += 1;
+                progress_tsfn.call(
+                    (count, total_slabs),
+                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+        });
+
+        let mut writer = ChunkWriter {
+            tsfn: self.chunk_tsfn.clone(),
+        };
+
+        RUNTIME.block_on(async move {
+            sdk.download(
+                &mut writer,
+                &obj,
+                indexd::DownloadOptions {
+                    offset: 0,
+                    length: None,
+                    max_inflight,
+                    slab_downloaded: Some(slab_tx),
+                    sector_downloaded: None,
+                },
+            )
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))
+        })
+    }
+
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
+    }
+}
+
+// -- UploadSlabTask --
+
+pub struct UploadSlabTask {
+    sdk: indexd::SDK,
+    data: Vec<u8>,
+    data_key_bytes: Vec<u8>,
+    stream_offset: u64,
+    data_shards: u8,
+    parity_shards: u8,
+    max_inflight: usize,
+    tsfn: napi::threadsafe_function::ThreadsafeFunction<
+        (u64, u64),
+        napi::threadsafe_function::ErrorStrategy::Fatal,
+    >,
+}
+
+impl Task for UploadSlabTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let sdk = self.sdk.clone();
+        let data = std::mem::take(&mut self.data);
+        let key_bytes = std::mem::take(&mut self.data_key_bytes);
+        let encryption_key = sia::encryption::EncryptionKey::try_from(key_bytes.as_slice())
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let offset = self.stream_offset;
+        let data_shards = self.data_shards;
+        let parity_shards = self.parity_shards;
+        let max_inflight = self.max_inflight;
+        let total_shards = data_shards as u64 + parity_shards as u64;
+        let tsfn = self.tsfn.clone();
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<()>();
+        RUNTIME.spawn(async move {
+            let mut count: u64 = 0;
+            while progress_rx.recv().await.is_some() {
+                count += 1;
+                tsfn.call(
+                    (count, total_shards),
+                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+        });
+
+        let slab = RUNTIME.block_on(async move {
+            sdk.upload_slab_raw(
+                &data,
+                &encryption_key,
+                offset,
+                indexd::UploadOptions {
+                    max_inflight,
+                    data_shards,
+                    parity_shards,
+                    shard_uploaded: Some(progress_tx),
+                },
+            )
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))
+        })?;
+
+        let slab_json = SlabJson::from_indexd(slab);
+        serde_json::to_string(&slab_json).map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+// -- ChannelReader (AsyncRead adapter for streaming uploads) --
+
+struct ChannelReader {
+    rx: mpsc::Receiver<Vec<u8>>,
+    buffer: Vec<u8>,
+    pos: usize,
+}
+
+impl ChannelReader {
+    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        ChannelReader {
+            rx,
+            buffer: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl AsyncRead for ChannelReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        // Return buffered data from previous chunk
+        if this.pos < this.buffer.len() {
+            let n = std::cmp::min(buf.remaining(), this.buffer.len() - this.pos);
+            buf.put_slice(&this.buffer[this.pos..this.pos + n]);
+            this.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+
+        // Receive next chunk
+        match this.rx.poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                let n = std::cmp::min(buf.remaining(), data.len());
+                buf.put_slice(&data[..n]);
+                if n < data.len() {
+                    this.buffer = data;
+                    this.pos = n;
+                } else {
+                    this.buffer.clear();
+                    this.pos = 0;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// -- NativeStreamingUpload --
+
+#[napi]
+pub struct NativeStreamingUpload {
+    tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    result: Mutex<Option<oneshot::Receiver<std::result::Result<indexd::Object, String>>>>,
+    #[allow(dead_code)]
+    upload_task: Mutex<Option<AbortOnDropHandle<()>>>,
+}
+
+#[napi]
+impl NativeStreamingUpload {
+    #[napi(js_name = "pushChunk")]
+    pub async fn push_chunk(&self, data: Option<Buffer>) -> Result<()> {
+        match data {
+            Some(buf) => {
+                let tx = {
+                    let guard = self.tx.lock().unwrap();
+                    guard
+                        .as_ref()
+                        .ok_or_else(|| Error::from_reason("upload already closed"))?
+                        .clone()
+                };
+                let bytes = buf.to_vec();
+                spawn(async move {
+                    tx.send(bytes)
+                        .await
+                        .map_err(|_| "upload channel closed".to_string())
+                })
+                .await
+                .map_err(|e| Error::from_reason(e.to_string()))?
+                .map_err(|e| Error::from_reason(e))?;
+            }
+            None => {
+                // Drop sender to signal EOF
+                self.tx.lock().unwrap().take();
+            }
+        }
+        Ok(())
+    }
+
+    #[napi]
+    pub async fn promise(&self) -> Result<NativePinnedObject> {
+        let rx = self
+            .result
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| Error::from_reason("promise already consumed"))?;
+        let obj = spawn(async move { rx.await.map_err(|_| "upload task dropped".to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e))?
+            .map_err(|e| Error::from_reason(e))?;
+        Ok(NativePinnedObject::from_object(obj))
+    }
+}
+
+// -- Chunked upload session storage --
+
+static CHUNK_BUFFERS: LazyLock<Mutex<HashMap<u64, (Vec<u8>, usize)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 // -- NativeSDK --
 
 #[napi]
@@ -958,118 +1359,201 @@ impl NativeSDK {
         }
     }
 
-    #[napi(js_name = "uploadSlab")]
-    pub async fn upload_slab(
+    #[napi(
+        js_name = "uploadSlab",
+        ts_args_type = "data: Buffer, dataKey: Buffer, offset: number, options: NativeUploadOptions, onProgress: (current: number, total: number) => void",
+        ts_return_type = "Promise<string>"
+    )]
+    pub fn upload_slab(
         &self,
         data: Buffer,
         data_key: Buffer,
         offset: u32,
         options: NativeUploadOptions,
-    ) -> Result<String> {
+        on_progress: JsFunction,
+    ) -> Result<AsyncTask<UploadSlabTask>> {
         let data_shards = options.data_shards.unwrap_or(10) as u8;
         let parity_shards = options.parity_shards.unwrap_or(20) as u8;
         let max_inflight = options.max_inflight.unwrap_or(10) as usize;
 
-        let key_bytes = data_key.as_ref();
-        let encryption_key = sia::encryption::EncryptionKey::try_from(key_bytes)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let tsfn: napi::threadsafe_function::ThreadsafeFunction<
+            (u64, u64),
+            napi::threadsafe_function::ErrorStrategy::Fatal,
+        > = on_progress.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<(u64, u64)>| {
+                let current = ctx.env.create_double(ctx.value.0 as f64)?;
+                let total = ctx.env.create_double(ctx.value.1 as f64)?;
+                Ok(vec![current, total])
+            },
+        )?;
 
-        let data_bytes = data.to_vec();
-        let sdk = self.inner.clone();
-
-        let slab = spawn(async move {
-            sdk.upload_slab_raw(
-                &data_bytes,
-                &encryption_key,
-                offset as u64,
-                indexd::UploadOptions {
-                    max_inflight,
-                    data_shards,
-                    parity_shards,
-                    shard_uploaded: None,
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(|e| Error::from_reason(e))?;
-
-        let slab_json = SlabJson::from_indexd(slab);
-        serde_json::to_string(&slab_json).map_err(|e| Error::from_reason(e.to_string()))
+        Ok(AsyncTask::new(UploadSlabTask {
+            sdk: self.inner.clone(),
+            data: data.to_vec(),
+            data_key_bytes: data_key.to_vec(),
+            stream_offset: offset as u64,
+            data_shards,
+            parity_shards,
+            max_inflight,
+            tsfn,
+        }))
     }
 
-    #[napi]
-    pub async fn download(
+    #[napi(
+        js_name = "download",
+        ts_args_type = "object: NativePinnedObject, options: NativeDownloadOptions, onProgress: (current: number, total: number) => void, onSector: (hostKey: string) => void",
+        ts_return_type = "Promise<Buffer>"
+    )]
+    pub fn download(
         &self,
         object: &NativePinnedObject,
         options: NativeDownloadOptions,
-    ) -> Result<Buffer> {
-        let obj = object.object();
-        let sdk = self.inner.clone();
+        on_progress: JsFunction,
+        on_sector: JsFunction,
+    ) -> Result<AsyncTask<DownloadTask>> {
         let max_inflight = options.max_inflight.unwrap_or(10) as usize;
 
-        let data = spawn(async move {
-            let mut buf = Vec::new();
-            sdk.download(
-                &mut buf,
-                &obj,
-                indexd::DownloadOptions {
-                    offset: 0,
-                    length: None,
-                    max_inflight,
-                    slab_downloaded: None,
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            Ok::<Vec<u8>, String>(buf)
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(|e| Error::from_reason(e))?;
+        let progress_tsfn = on_progress.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<(u32, u32)>| {
+                let current = ctx.env.create_double(ctx.value.0 as f64)?;
+                let total = ctx.env.create_double(ctx.value.1 as f64)?;
+                Ok(vec![current, total])
+            },
+        )?;
 
-        Ok(Buffer::from(data))
+        let sector_tsfn = on_sector.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<String>| {
+                let key = ctx.env.create_string(&ctx.value)?;
+                Ok(vec![key])
+            },
+        )?;
+
+        Ok(AsyncTask::new(DownloadTask {
+            sdk: self.inner.clone(),
+            obj: object.object(),
+            max_inflight,
+            offset: 0,
+            length: None,
+            progress_tsfn: Some(progress_tsfn),
+            sector_tsfn: Some(sector_tsfn),
+        }))
     }
 
-    #[napi(js_name = "downloadSlabByIndex")]
-    pub async fn download_slab_by_index(
+    #[napi(
+        js_name = "downloadRange",
+        ts_args_type = "object: NativePinnedObject, offset: number, length: number, options: NativeDownloadOptions, onSector: (hostKey: string) => void",
+        ts_return_type = "Promise<Buffer>"
+    )]
+    pub fn download_range(
+        &self,
+        object: &NativePinnedObject,
+        offset: f64,
+        length: f64,
+        options: NativeDownloadOptions,
+        on_sector: JsFunction,
+    ) -> Result<AsyncTask<DownloadTask>> {
+        let max_inflight = options.max_inflight.unwrap_or(10) as usize;
+
+        let sector_tsfn = on_sector.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<String>| {
+                let key = ctx.env.create_string(&ctx.value)?;
+                Ok(vec![key])
+            },
+        )?;
+
+        Ok(AsyncTask::new(DownloadTask {
+            sdk: self.inner.clone(),
+            obj: object.object(),
+            max_inflight,
+            offset: offset as u64,
+            length: Some(length as u64),
+            progress_tsfn: None,
+            sector_tsfn: Some(sector_tsfn),
+        }))
+    }
+
+    #[napi(
+        js_name = "downloadStreaming",
+        ts_args_type = "object: NativePinnedObject, options: NativeDownloadOptions, onChunk: (data: Buffer) => void, onProgress: (current: number, total: number) => void",
+        ts_return_type = "Promise<void>"
+    )]
+    pub fn download_streaming(
+        &self,
+        object: &NativePinnedObject,
+        options: NativeDownloadOptions,
+        on_chunk: JsFunction,
+        on_progress: JsFunction,
+    ) -> Result<AsyncTask<DownloadStreamingTask>> {
+        let max_inflight = options.max_inflight.unwrap_or(10) as usize;
+
+        let chunk_tsfn = on_chunk.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<Vec<u8>>| {
+                let buf = ctx.env.create_buffer_with_data(ctx.value)?;
+                Ok(vec![buf.into_raw()])
+            },
+        )?;
+
+        let progress_tsfn = on_progress.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<(u32, u32)>| {
+                let current = ctx.env.create_double(ctx.value.0 as f64)?;
+                let total = ctx.env.create_double(ctx.value.1 as f64)?;
+                Ok(vec![current, total])
+            },
+        )?;
+
+        Ok(AsyncTask::new(DownloadStreamingTask {
+            sdk: self.inner.clone(),
+            obj: object.object(),
+            max_inflight,
+            chunk_tsfn,
+            progress_tsfn,
+        }))
+    }
+
+    #[napi(
+        js_name = "downloadSlabByIndex",
+        ts_args_type = "object: NativePinnedObject, index: number, options: NativeDownloadOptions, onSector: (hostKey: string) => void",
+        ts_return_type = "Promise<Buffer>"
+    )]
+    pub fn download_slab_by_index(
         &self,
         object: &NativePinnedObject,
         index: u32,
         options: NativeDownloadOptions,
-    ) -> Result<Buffer> {
-        let obj = object.object();
-        let sdk = self.inner.clone();
+        on_sector: JsFunction,
+    ) -> Result<AsyncTask<DownloadTask>> {
         let max_inflight = options.max_inflight.unwrap_or(10) as usize;
+        let obj = object.object();
         let slabs = obj.slabs();
         let slab = slabs
             .get(index as usize)
-            .ok_or_else(|| Error::from_reason(format!("slab index {} out of range", index)))?
-            .clone();
+            .ok_or_else(|| Error::from_reason(format!("slab index {} out of range", index)))?;
+        let slab_offset = slab.offset as u64;
+        let slab_length = slab.length as u64;
 
-        let data = spawn(async move {
-            let mut buf = Vec::new();
-            sdk.download(
-                &mut buf,
-                &obj,
-                indexd::DownloadOptions {
-                    offset: slab.offset as u64,
-                    length: Some(slab.length as u64),
-                    max_inflight,
-                    slab_downloaded: None,
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            Ok::<Vec<u8>, String>(buf)
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(|e| Error::from_reason(e))?;
+        let sector_tsfn = on_sector.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<String>| {
+                let key = ctx.env.create_string(&ctx.value)?;
+                Ok(vec![key])
+            },
+        )?;
 
-        Ok(Buffer::from(data))
+        Ok(AsyncTask::new(DownloadTask {
+            sdk: self.inner.clone(),
+            obj,
+            max_inflight,
+            offset: slab_offset,
+            length: Some(slab_length),
+            progress_tsfn: None,
+            sector_tsfn: Some(sector_tsfn),
+        }))
     }
 
     #[napi(js_name = "generateDataKey")]
@@ -1139,9 +1623,13 @@ impl NativeSDK {
 
     #[napi(js_name = "sharedObject")]
     pub async fn shared_object(&self, url: String) -> Result<NativePinnedObject> {
-        let shared_url: Url = url
-            .parse()
-            .map_err(|e| Error::from_reason(format!("{e}")))?;
+        let shared_url: Url = if url.starts_with("sia://") {
+            format!("https://{}", &url[6..])
+        } else {
+            url
+        }
+        .parse()
+        .map_err(|e| Error::from_reason(format!("{e}")))?;
         let sdk = self.inner.clone();
         let obj = spawn(async move {
             sdk.shared_object(shared_url)
@@ -1152,6 +1640,239 @@ impl NativeSDK {
         .map_err(|e| Error::from_reason(e.to_string()))?
         .map_err(|e| Error::from_reason(e))?;
         Ok(NativePinnedObject::from_object(obj))
+    }
+
+    #[napi(js_name = "shareObject")]
+    pub fn share_object(
+        &self,
+        object: &NativePinnedObject,
+        valid_until_ms: f64,
+    ) -> Result<String> {
+        let obj = object.object();
+        let duration = std::time::Duration::from_millis(valid_until_ms as u64);
+        let valid_until = SystemTime::UNIX_EPOCH + duration;
+        let url = self
+            .inner
+            .share_object(&obj, valid_until.into())
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let url_str = url.to_string();
+        Ok(if let Some(rest) = url_str.strip_prefix("https://") {
+            format!("sia://{rest}")
+        } else {
+            url_str
+        })
+    }
+
+    #[napi]
+    pub async fn hosts(&self) -> Result<String> {
+        let sdk = self.inner.clone();
+        let hosts = spawn(async move {
+            sdk.hosts(Default::default())
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| Error::from_reason(e.to_string()))?
+        .map_err(|e| Error::from_reason(e))?;
+        serde_json::to_string(&hosts).map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub async fn account(&self) -> Result<String> {
+        let sdk = self.inner.clone();
+        let a = spawn(async move { sdk.account().await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e))?;
+        let obj = serde_json::json!({
+            "accountKey": a.account_key.to_string(),
+            "connectKey": a.connect_key,
+            "maxPinnedData": a.max_pinned_data,
+            "pinnedData": a.pinned_data,
+            "app": {
+                "id": a.app.id.to_string(),
+                "description": a.app.description,
+                "serviceUrl": a.app.service_url,
+                "logoUrl": a.app.logo_url,
+            },
+            "lastUsed": system_time_to_epoch_ms(a.last_used.into()),
+        });
+        serde_json::to_string(&obj).map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi(js_name = "pruneSlabs")]
+    pub async fn prune_slabs(&self) -> Result<()> {
+        let sdk = self.inner.clone();
+        spawn(async move { sdk.prune_slabs().await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e))?;
+        Ok(())
+    }
+
+    #[napi(js_name = "slabDataSize")]
+    pub fn slab_data_size(&self) -> f64 {
+        let defaults = indexd::UploadOptions::default();
+        (defaults.data_shards as usize * SECTOR_SIZE) as f64
+    }
+
+    #[napi(js_name = "startChunkedUpload")]
+    pub fn start_chunked_upload(&self, total_size: f64) -> f64 {
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let size = total_size as usize;
+        let buffer = vec![0u8; size];
+        CHUNK_BUFFERS
+            .lock()
+            .unwrap()
+            .insert(session_id, (buffer, 0));
+        session_id as f64
+    }
+
+    #[napi(js_name = "uploadChunk")]
+    pub fn upload_chunk(&self, session_id: f64, chunk: Buffer) -> Result<f64> {
+        let mut buffers = CHUNK_BUFFERS.lock().unwrap();
+        let (buffer, offset) = buffers
+            .get_mut(&(session_id as u64))
+            .ok_or_else(|| {
+                Error::from_reason("Invalid session ID. Call startChunkedUpload first.")
+            })?;
+
+        let end = *offset + chunk.len();
+        if end > buffer.len() {
+            return Err(Error::from_reason("Chunk exceeds total size"));
+        }
+
+        buffer[*offset..end].copy_from_slice(chunk.as_ref());
+        *offset = end;
+        Ok(*offset as f64)
+    }
+
+    #[napi(
+        js_name = "finalizeChunkedUpload",
+        ts_args_type = "sessionId: number, options: NativeUploadOptions, onProgress: (current: number, total: number) => void",
+        ts_return_type = "Promise<NativePinnedObject>"
+    )]
+    pub fn finalize_chunked_upload(
+        &self,
+        session_id: f64,
+        options: NativeUploadOptions,
+        on_progress: JsFunction,
+    ) -> Result<AsyncTask<UploadTask>> {
+        let (data, final_offset) = CHUNK_BUFFERS
+            .lock()
+            .unwrap()
+            .remove(&(session_id as u64))
+            .ok_or_else(|| {
+                Error::from_reason("Invalid session ID or session already finalized")
+            })?;
+
+        if final_offset != data.len() {
+            return Err(Error::from_reason(format!(
+                "Incomplete upload: expected {} bytes, got {} bytes",
+                data.len(),
+                final_offset
+            )));
+        }
+
+        let data_shards = options.data_shards.unwrap_or(10) as u8;
+        let parity_shards = options.parity_shards.unwrap_or(20) as u8;
+        let max_inflight = options.max_inflight.unwrap_or(10) as usize;
+
+        let tsfn: napi::threadsafe_function::ThreadsafeFunction<
+            (u64, u64),
+            napi::threadsafe_function::ErrorStrategy::Fatal,
+        > = on_progress.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<(u64, u64)>| {
+                let current = ctx.env.create_double(ctx.value.0 as f64)?;
+                let total = ctx.env.create_double(ctx.value.1 as f64)?;
+                Ok(vec![current, total])
+            },
+        )?;
+
+        Ok(AsyncTask::new(UploadTask {
+            sdk: self.inner.clone(),
+            data,
+            data_shards,
+            parity_shards,
+            max_inflight,
+            tsfn,
+        }))
+    }
+
+    #[napi(
+        js_name = "streamingUpload",
+        ts_args_type = "totalSize: number, options: NativeUploadOptions, onProgress: (current: number, total: number) => void",
+        ts_return_type = "NativeStreamingUpload"
+    )]
+    pub fn streaming_upload(
+        &self,
+        _total_size: f64,
+        options: NativeUploadOptions,
+        on_progress: JsFunction,
+    ) -> Result<NativeStreamingUpload> {
+        let data_shards = options.data_shards.unwrap_or(10) as u8;
+        let parity_shards = options.parity_shards.unwrap_or(20) as u8;
+        let max_inflight = options.max_inflight.unwrap_or(10) as usize;
+
+        let total_shards_per_slab = data_shards as u64 + parity_shards as u64;
+        let slab_encoded_size = total_shards_per_slab * SECTOR_SIZE as u64;
+
+        let tsfn: napi::threadsafe_function::ThreadsafeFunction<
+            (u64, u64),
+            napi::threadsafe_function::ErrorStrategy::Fatal,
+        > = on_progress.create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<(u64, u64)>| {
+                let current = ctx.env.create_double(ctx.value.0 as f64)?;
+                let total = ctx.env.create_double(ctx.value.1 as f64)?;
+                Ok(vec![current, total])
+            },
+        )?;
+
+        // Bounded channel for backpressure (~2 slabs worth)
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(2);
+        let (result_tx, result_rx) = oneshot::channel();
+
+        let sdk = self.inner.clone();
+        let upload_task = spawn(async move {
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<()>();
+
+            tokio::spawn(async move {
+                let mut sectors: u64 = 0;
+                while progress_rx.recv().await.is_some() {
+                    sectors += 1;
+                    let size = sectors * SECTOR_SIZE as u64;
+                    let slabs_size =
+                        sectors.div_ceil(total_shards_per_slab) * slab_encoded_size;
+                    tsfn.call(
+                        (size, slabs_size),
+                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
+            });
+
+            let reader = ChannelReader::new(rx);
+            let result = sdk
+                .upload(
+                    reader,
+                    indexd::UploadOptions {
+                        max_inflight,
+                        data_shards,
+                        parity_shards,
+                        shard_uploaded: Some(progress_tx),
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string());
+            let _ = result_tx.send(result);
+        });
+
+        Ok(NativeStreamingUpload {
+            tx: Mutex::new(Some(tx)),
+            result: Mutex::new(Some(result_rx)),
+            upload_task: Mutex::new(Some(upload_task)),
+        })
     }
 }
 
@@ -1167,4 +1888,15 @@ pub fn generate_recovery_phrase() -> String {
 pub fn validate_recovery_phrase(phrase: String) -> Result<()> {
     Seed::new(&phrase).map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(())
+}
+
+#[napi(js_name = "setLogLevel")]
+pub fn set_log_level(level: String) {
+    let filter = match level.as_str() {
+        "debug" => log::LevelFilter::Debug,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => log::LevelFilter::Info,
+    };
+    log::set_max_level(filter);
 }
