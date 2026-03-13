@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 
@@ -15,6 +15,7 @@ use std::str::FromStr;
 use std::time::SystemTime;
 use chrono::{TimeZone, Utc};
 use tokio::io::AsyncWrite;
+use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
 
 /// Monotonically increasing ID counter for upload sessions and streaming readers
@@ -430,6 +431,129 @@ impl PinnedObject {
         }
         Ok(arr)
     }
+
+    /// Returns the creation timestamp as milliseconds since the Unix epoch.
+    #[wasm_bindgen(js_name = "createdAt")]
+    pub fn created_at(&self) -> Result<f64, JsError> {
+        let inner = self.inner.lock().map_err(to_js_err)?;
+        Ok(inner.created_at().timestamp_millis() as f64)
+    }
+
+    /// Returns the last-updated timestamp as milliseconds since the Unix epoch.
+    #[wasm_bindgen(js_name = "updatedAt")]
+    pub fn updated_at(&self) -> Result<f64, JsError> {
+        let inner = self.inner.lock().map_err(to_js_err)?;
+        Ok(inner.updated_at().timestamp_millis() as f64)
+    }
+}
+
+// ── PackedUpload ────────────────────────────────────────────────────────
+
+enum PackedUploadAction {
+    Add(Vec<u8>, oneshot::Sender<Result<u64, String>>),
+    Finalize(oneshot::Sender<Result<Vec<indexd::Object>, String>>),
+}
+
+/// A packed upload allows multiple objects to be uploaded together in a single
+/// upload. This can be more efficient than uploading each object separately if
+/// the size of the objects is less than the minimum slab size.
+#[wasm_bindgen]
+pub struct PackedUpload {
+    tx: Mutex<Option<mpsc::Sender<PackedUploadAction>>>,
+    slab_size: u64,
+    length: Arc<AtomicU64>,
+    closed: Arc<AtomicBool>,
+}
+
+#[wasm_bindgen]
+impl PackedUpload {
+    /// Returns the number of bytes remaining until reaching the next slab
+    /// boundary. Adding objects that fit within this size avoids starting a
+    /// new slab.
+    pub fn remaining(&self) -> f64 {
+        let length = self.length.load(Ordering::Acquire);
+        let r = if length == 0 {
+            self.slab_size
+        } else {
+            (self.slab_size - (length % self.slab_size)) % self.slab_size
+        };
+        r as f64
+    }
+
+    /// Returns the total number of bytes added so far.
+    pub fn length(&self) -> f64 {
+        self.length.load(Ordering::Acquire) as f64
+    }
+
+    /// Returns the number of slabs in the upload.
+    pub fn slabs(&self) -> f64 {
+        let len = self.length.load(Ordering::Acquire);
+        len.div_ceil(self.slab_size) as f64
+    }
+
+    /// Adds data to the packed upload. Returns the number of bytes written.
+    pub async fn add(&self, data: &[u8]) -> Result<f64, JsError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(JsError::new("packed upload is closed"));
+        }
+        let tx = {
+            let guard = self.tx.lock().map_err(to_js_err)?;
+            guard
+                .as_ref()
+                .ok_or_else(|| JsError::new("packed upload is closed"))?
+                .clone()
+        };
+        let bytes = data.to_vec();
+        let (add_tx, add_rx) = oneshot::channel();
+        tx.send(PackedUploadAction::Add(bytes, add_tx))
+            .await
+            .map_err(|_| JsError::new("packed upload channel closed"))?;
+        let written = add_rx
+            .await
+            .map_err(|_| JsError::new("packed upload result channel closed"))?
+            .map_err(|e| JsError::new(&e))?;
+        Ok(written as f64)
+    }
+
+    /// Finalizes the upload and returns the resulting PinnedObjects.
+    pub async fn finalize(&self) -> Result<JsValue, JsError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Err(JsError::new("packed upload is closed"));
+        }
+        let tx = {
+            let mut guard = self.tx.lock().map_err(to_js_err)?;
+            guard
+                .take()
+                .ok_or_else(|| JsError::new("packed upload is closed"))?
+        };
+        let (finalize_tx, finalize_rx) = oneshot::channel();
+        tx.send(PackedUploadAction::Finalize(finalize_tx))
+            .await
+            .map_err(|_| JsError::new("packed upload channel closed"))?;
+        let objects = finalize_rx
+            .await
+            .map_err(|_| JsError::new("packed upload result channel closed"))?
+            .map_err(|e| JsError::new(&e))?;
+        let arr = js_sys::Array::new();
+        for obj in objects {
+            let pinned = PinnedObject {
+                inner: Arc::new(Mutex::new(obj)),
+            };
+            arr.push(&pinned.into());
+        }
+        Ok(arr.into())
+    }
+
+    /// Cancels the upload. Drops the channel sender which aborts the
+    /// background upload task.
+    pub fn cancel(&self) -> Result<(), JsError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Err(JsError::new("packed upload is closed"));
+        }
+        let mut guard = self.tx.lock().map_err(to_js_err)?;
+        guard.take();
+        Ok(())
+    }
 }
 
 // ── SDK ─────────────────────────────────────────────────────────────────
@@ -729,6 +853,69 @@ impl SDK {
     #[wasm_bindgen(js_name = "slabDataSize")]
     pub fn slab_data_size(&self) -> f64 {
         UploadOptions::new().slab_data_size()
+    }
+
+    /// Creates a new packed upload. Multiple objects can be added to the
+    /// upload and they will share slabs, reducing wasted space for small files.
+    ///
+    /// Returns a `PackedUpload` handle with `add()`, `finalize()`, and `cancel()` methods.
+    #[wasm_bindgen(js_name = "uploadPacked")]
+    pub fn upload_packed(&self, options: UploadOptions) -> PackedUpload {
+        let data_shards = options.data_shards;
+        let parity_shards = options.parity_shards;
+        let max_inflight = options.max_inflight;
+
+        let sdk = self.inner.clone();
+        let (action_tx, mut action_rx) = mpsc::channel::<PackedUploadAction>(10);
+        let slab_size = data_shards as u64 * SECTOR_SIZE as u64;
+        let length = Arc::new(AtomicU64::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+
+        let task_length = length.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let _guard = rt.enter();
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async move {
+                    let mut packed_upload = sdk.upload_packed(indexd::UploadOptions {
+                        max_inflight,
+                        data_shards,
+                        parity_shards,
+                        shard_uploaded: None,
+                    });
+
+                    while let Some(action) = action_rx.recv().await {
+                        match action {
+                            PackedUploadAction::Add(data, add_tx) => {
+                                let reader = Cursor::new(data);
+                                let res =
+                                    packed_upload.add(reader).await.map_err(|e| e.to_string());
+                                if let Ok(size) = &res {
+                                    task_length.fetch_add(*size, Ordering::AcqRel);
+                                }
+                                let _ = add_tx.send(res);
+                            }
+                            PackedUploadAction::Finalize(finalize_tx) => {
+                                let result =
+                                    packed_upload.finalize().await.map_err(|e| e.to_string());
+                                let _ = finalize_tx.send(result);
+                                return;
+                            }
+                        }
+                    }
+                })
+                .await;
+        });
+
+        PackedUpload {
+            tx: Mutex::new(Some(action_tx)),
+            slab_size,
+            length,
+            closed,
+        }
     }
 
     /// Generates a random 32-byte encryption key for object-level encryption.
