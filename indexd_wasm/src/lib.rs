@@ -601,7 +601,7 @@ impl SDK {
         let on_progress = on_progress.clone();
         let object: indexd::Object = local
             .run_until(async {
-                tokio::task::spawn_local(async move {
+                let handle = tokio::task::spawn_local(async move {
                     let mut count: u32 = 0;
                     while rx.recv().await.is_some() {
                         count += 1;
@@ -612,7 +612,9 @@ impl SDK {
                         );
                     }
                 });
-                self.inner.upload(cursor, options).await
+                let result = self.inner.upload(cursor, options).await;
+                let _ = handle.await;
+                result
             })
             .await
             .map_err(to_js_err)?;
@@ -647,7 +649,7 @@ impl SDK {
         let on_progress = on_progress.clone();
         local
             .run_until(async {
-                tokio::task::spawn_local(async move {
+                let handle = tokio::task::spawn_local(async move {
                     let mut count: u32 = 0;
                     while rx.recv().await.is_some() {
                         count += 1;
@@ -658,9 +660,12 @@ impl SDK {
                         );
                     }
                 });
-                self.inner
+                let result = self
+                    .inner
                     .download(&mut Cursor::new(&mut buf), &obj, options)
-                    .await
+                    .await;
+                let _ = handle.await;
+                result
             })
             .await
             .map_err(to_js_err)?;
@@ -699,7 +704,7 @@ impl SDK {
         let on_sector = on_sector.clone();
         local
             .run_until(async {
-                tokio::task::spawn_local(async move {
+                let handle = tokio::task::spawn_local(async move {
                     while let Some(host_key) = sector_rx.recv().await {
                         let _ = on_sector.call1(
                             &JsValue::NULL,
@@ -707,9 +712,12 @@ impl SDK {
                         );
                     }
                 });
-                self.inner
+                let result = self
+                    .inner
                     .download(&mut Cursor::new(&mut buf), &obj, options)
-                    .await
+                    .await;
+                let _ = handle.await;
+                result
             })
             .await
             .map_err(to_js_err)?;
@@ -775,7 +783,7 @@ impl SDK {
         let on_progress = on_progress.clone();
         local
             .run_until(async {
-                tokio::task::spawn_local(async move {
+                let handle = tokio::task::spawn_local(async move {
                     let mut count: u32 = 0;
                     while rx.recv().await.is_some() {
                         count += 1;
@@ -786,7 +794,9 @@ impl SDK {
                         );
                     }
                 });
-                self.inner.download(&mut writer, &obj, options).await
+                let result = self.inner.download(&mut writer, &obj, options).await;
+                let _ = handle.await;
+                result
             })
             .await
             .map_err(to_js_err)?;
@@ -831,7 +841,7 @@ impl SDK {
         let on_sector = on_sector.clone();
         local
             .run_until(async {
-                tokio::task::spawn_local(async move {
+                let handle = tokio::task::spawn_local(async move {
                     while let Some(host_key) = sector_rx.recv().await {
                         let _ = on_sector.call1(
                             &JsValue::NULL,
@@ -839,9 +849,12 @@ impl SDK {
                         );
                     }
                 });
-                self.inner
+                let result = self
+                    .inner
                     .download(&mut Cursor::new(&mut buf), &obj, options)
-                    .await
+                    .await;
+                let _ = handle.await;
+                result
             })
             .await
             .map_err(to_js_err)?;
@@ -960,7 +973,7 @@ impl SDK {
         let on_progress = on_progress.clone();
         let slab = local
             .run_until(async {
-                tokio::task::spawn_local(async move {
+                let handle = tokio::task::spawn_local(async move {
                     let mut count: u32 = 0;
                     while rx.recv().await.is_some() {
                         count += 1;
@@ -971,9 +984,14 @@ impl SDK {
                         );
                     }
                 });
-                self.inner
+                let result = self
+                    .inner
                     .upload_slab_raw(data, &key, stream_offset as u64, options)
-                    .await
+                    .await;
+                // Wait for the progress task to finish draining the channel
+                // before returning, so the JS callback isn't dropped mid-invocation.
+                let _ = handle.await;
+                result
             })
             .await
             .map_err(to_js_err)?;
@@ -1112,7 +1130,7 @@ impl SDK {
         let on_progress = on_progress.clone();
         let object: indexd::Object = local
             .run_until(async {
-                tokio::task::spawn_local(async move {
+                let handle = tokio::task::spawn_local(async move {
                     let mut count: u32 = 0;
                     while rx.recv().await.is_some() {
                         count += 1;
@@ -1123,7 +1141,9 @@ impl SDK {
                         );
                     }
                 });
-                self.inner.upload(cursor, options).await
+                let result = self.inner.upload(cursor, options).await;
+                let _ = handle.await;
+                result
             })
             .await
             .map_err(to_js_err)?;
@@ -1211,7 +1231,7 @@ impl SDK {
             let object: indexd::Object = local
                 .run_until(async move {
                     // Spawn progress tracking task
-                    tokio::task::spawn_local(async move {
+                    let handle = tokio::task::spawn_local(async move {
                         let mut count: u32 = 0;
                         while rx.recv().await.is_some() {
                             count += 1;
@@ -1224,7 +1244,9 @@ impl SDK {
                     });
 
                     // Run the upload
-                    inner.upload(reader, options).await
+                    let result = inner.upload(reader, options).await;
+                    let _ = handle.await;
+                    result
                 })
                 .await
                 .map_err(to_js_err)?;
