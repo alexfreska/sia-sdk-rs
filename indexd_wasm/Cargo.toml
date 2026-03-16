@@ -26,7 +26,7 @@ thiserror = "2.0"
 rand = "0.10.0"
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
-tokio = { version = "1.49.0", features = ["rt"] }
+tokio = { version = "1.49.0", features = ["rt", "macros"] }
 console_error_panic_hook = "0.1"
 log = "0.4"
 console_log = "1"
